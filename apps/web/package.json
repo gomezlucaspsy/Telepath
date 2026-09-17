@@ -6,9 +6,13 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "crypto:selftest": "tsx lib/crypto/selftest.ts"
   },
   "dependencies": {
+    "@microsoft/signalr": "^10.0.11",
+    "jsqr": "^1.4.0",
+    "libsodium-wrappers-sumo": "^0.8.4",
     "next": "16.3.5",
     "qrcode": "^1.5.4",
     "react": "19.2.8",
@@ -16,6 +20,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/libsodium-wrappers-sumo": "^0.7.8",
     "@types/node": "^20",
     "@types/qrcode": "^1.5.6",
     "@types/react": "^19",
@@ -23,6 +28,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.3.5",
     "tailwindcss": "^4",
+    "tsx": "^4.23.13",
     "typescript": "^5"
   }
 }

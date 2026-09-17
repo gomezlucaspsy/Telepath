@@ -5,9 +5,9 @@ namespace Telepath.Server.Services;
 
 public interface IPairingStore
 {
-    PairingSession Create();
+    PairingSession Create(string creatorPublicKey, string creatorConnectionId);
     PairingSession? Get(string code);
-    bool Complete(string code, string publicKey);
+    bool Complete(string code, string peerPublicKey, string peerConnectionId);
 }
 
 // In-memory placeholder for scaffolding. Swap for a persistent store
@@ -17,13 +17,15 @@ public class InMemoryPairingStore : IPairingStore
 {
     private readonly ConcurrentDictionary<string, PairingSession> _sessions = new();
 
-    public PairingSession Create()
+    public PairingSession Create(string creatorPublicKey, string creatorConnectionId)
     {
         var code = Random.Shared.Next(0, 999_999).ToString("D6");
         var session = new PairingSession
         {
             Code = code,
-            ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5)
+            ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+            CreatorPublicKey = creatorPublicKey,
+            CreatorConnectionId = creatorConnectionId,
         };
         _sessions[code] = session;
         return session;
@@ -40,11 +42,12 @@ public class InMemoryPairingStore : IPairingStore
         return session;
     }
 
-    public bool Complete(string code, string publicKey)
+    public bool Complete(string code, string peerPublicKey, string peerConnectionId)
     {
         var session = Get(code);
         if (session is null) return false;
-        session.LinkedPublicKey = publicKey;
+        session.PeerPublicKey = peerPublicKey;
+        session.PeerConnectionId = peerConnectionId;
         return true;
     }
 }
