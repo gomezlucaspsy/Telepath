@@ -9,10 +9,17 @@ import { establishSession } from "@/lib/crypto/session";
 import { RatchetSession, type WireMessage } from "@/lib/crypto/doubleRatchet";
 import type { KeyPair } from "@/lib/crypto/identity";
 import { scanQrCode } from "@/lib/qrScanner";
+import {
+  appendMessage,
+  createConversation,
+  deleteConversation,
+  listConversations,
+  type StoredConversation,
+} from "@/lib/conversations";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://localhost:7218";
 
-type Phase = "loading" | "idle" | "waiting-peer" | "scanning" | "chatting" | "error";
+type Phase = "loading" | "list" | "new" | "waiting-peer" | "scanning" | "chatting" | "error";
 type ChatMessage = { fromMe: boolean; text: string };
 
 type SessionStatusResponse = {
@@ -28,6 +35,8 @@ export default function Home() {
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [joinCodeInput, setJoinCodeInput] = useState("");
+  const [conversations, setConversations] = useState<StoredConversation[]>([]);
+  const [activeLabel, setActiveLabel] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [errorText, setErrorText] = useState<string | null>(null);
@@ -37,18 +46,30 @@ export default function Home() {
   const connectionIdRef = useRef<string | null>(null);
   const ratchetRef = useRef<RatchetSession | null>(null);
   const peerConnectionIdRef = useRef<string | null>(null);
+  const activePeerKeyRef = useRef<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scanAbortRef = useRef<AbortController | null>(null);
+
+  const refreshConversations = useCallback(() => {
+    setConversations(listConversations());
+  }, []);
 
   const handleIncoming = useCallback((msg: IncomingMessage) => {
     if (!ratchetRef.current || msg.senderConnectionId !== peerConnectionIdRef.current) return;
     const wireMsg = JSON.parse(msg.payload) as WireMessage;
     ratchetRef.current
       .decrypt(wireMsg)
-      .then((text) => setMessages((prev) => [...prev, { fromMe: false, text }]))
+      .then((text) => {
+        setMessages((prev) => [...prev, { fromMe: false, text }]);
+        const peerKey = activePeerKeyRef.current;
+        if (peerKey && ratchetRef.current) {
+          appendMessage(peerKey, { fromMe: false, text }, ratchetRef.current.toJSON());
+          refreshConversations();
+        }
+      })
       .catch(() => setErrorText("No se pudo descifrar un mensaje entrante."));
-  }, []);
+  }, [refreshConversations]);
 
   useEffect(() => {
     let cancelled = false;
@@ -60,7 +81,8 @@ export default function Home() {
         if (cancelled) return;
         connectionRef.current = connection;
         connectionIdRef.current = connection.connectionId;
-        setPhase("idle");
+        refreshConversations();
+        setPhase("list");
       } catch {
         if (!cancelled) {
           setErrorText("No se pudo conectar con el servidor. ¿Está corriendo el backend?");
@@ -73,7 +95,61 @@ export default function Home() {
       if (pollRef.current) clearInterval(pollRef.current);
       connectionRef.current?.stop();
     };
-  }, [handleIncoming]);
+  }, [handleIncoming, refreshConversations]);
+
+  const openConversation = useCallback((conv: StoredConversation) => {
+    ratchetRef.current = RatchetSession.fromJSON(conv.ratchetSessionJson);
+    peerConnectionIdRef.current = conv.peerConnectionId;
+    activePeerKeyRef.current = conv.peerPublicKey;
+    setActiveLabel(conv.label);
+    setMessages(conv.messages.map((m) => ({ fromMe: m.fromMe, text: m.text })));
+    setErrorText(null);
+    setPhase("chatting");
+  }, []);
+
+  const backToList = useCallback(() => {
+    ratchetRef.current = null;
+    peerConnectionIdRef.current = null;
+    activePeerKeyRef.current = null;
+    setMessages([]);
+    refreshConversations();
+    setPhase("list");
+  }, [refreshConversations]);
+
+  const handleDelete = useCallback((peerPublicKey: string, label: string) => {
+    if (!window.confirm(`¿Borrar la conversación con "${label}"? Esto borra los mensajes y las claves de sesión de este dispositivo, sin vuelta atrás.`)) {
+      return;
+    }
+    deleteConversation(peerPublicKey);
+    if (activePeerKeyRef.current === peerPublicKey) {
+      backToList();
+    } else {
+      refreshConversations();
+    }
+  }, [backToList, refreshConversations]);
+
+  const startNewConversation = useCallback(() => {
+    setErrorText(null);
+    setJoinCodeInput("");
+    setQrDataUrl(null);
+    setPairingCode(null);
+    setPhase("new");
+  }, []);
+
+  const openEstablishedConversation = useCallback((peerPublicKey: string, peerConnectionId: string, session: RatchetSession) => {
+    ratchetRef.current = session;
+    peerConnectionIdRef.current = peerConnectionId;
+    const conv = createConversation({
+      peerPublicKey,
+      peerConnectionId,
+      ratchetSessionJson: session.toJSON(),
+    });
+    activePeerKeyRef.current = conv.peerPublicKey;
+    setActiveLabel(conv.label);
+    setMessages(conv.messages.map((m) => ({ fromMe: m.fromMe, text: m.text })));
+    refreshConversations();
+    setPhase("chatting");
+  }, [refreshConversations]);
 
   const startPairing = useCallback(async () => {
     if (!identityRef.current || !connectionIdRef.current) return;
@@ -98,20 +174,18 @@ export default function Home() {
         const status: SessionStatusResponse = await statusRes.json();
         if (status.isCompleted && status.peerPublicKey && status.peerConnectionId) {
           if (pollRef.current) clearInterval(pollRef.current);
-          peerConnectionIdRef.current = status.peerConnectionId;
           const session = await establishSession(
             identityRef.current!,
             publicKeyFromBase64(status.peerPublicKey)
           );
-          ratchetRef.current = session;
-          setPhase("chatting");
+          openEstablishedConversation(status.peerPublicKey, status.peerConnectionId, session);
         }
       }, 2000);
     } catch {
       setErrorText("No se pudo conectar con el servidor. ¿Está corriendo el backend?");
       setPhase("error");
     }
-  }, []);
+  }, [openEstablishedConversation]);
 
   const joinWithCode = useCallback(async (codeArg?: string) => {
     const code = codeArg ?? joinCodeInput;
@@ -134,18 +208,16 @@ export default function Home() {
       );
       if (!completeRes.ok) throw new Error("No se pudo completar el emparejamiento");
 
-      peerConnectionIdRef.current = status.creatorConnectionId;
       const session = await establishSession(
         identityRef.current,
         publicKeyFromBase64(status.creatorPublicKey)
       );
-      ratchetRef.current = session;
-      setPhase("chatting");
+      openEstablishedConversation(status.creatorPublicKey, status.creatorConnectionId, session);
     } catch {
       setErrorText("No se pudo unir con ese código. ¿Es correcto y sigue vigente?");
-      setPhase("idle");
+      setPhase("new");
     }
-  }, [joinCodeInput]);
+  }, [joinCodeInput, openEstablishedConversation]);
 
   const startScanning = useCallback(() => {
     setErrorText(null);
@@ -154,7 +226,7 @@ export default function Home() {
 
   const cancelScanning = useCallback(() => {
     scanAbortRef.current?.abort();
-    setPhase("idle");
+    setPhase("new");
   }, []);
 
   useEffect(() => {
@@ -166,7 +238,7 @@ export default function Home() {
       .catch((err: Error) => {
         if (err.name === "AbortError") return;
         setErrorText("No se pudo acceder a la cámara para escanear el QR.");
-        setPhase("idle");
+        setPhase("new");
       });
     return () => controller.abort();
   }, [phase, joinWithCode]);
@@ -180,13 +252,30 @@ export default function Home() {
     const wireMsg = await ratchetRef.current.encrypt(text);
     await sendEncrypted(connectionRef.current, peerConnectionIdRef.current, JSON.stringify(wireMsg));
     setMessages((prev) => [...prev, { fromMe: true, text }]);
+    const peerKey = activePeerKeyRef.current;
+    if (peerKey) {
+      appendMessage(peerKey, { fromMe: true, text }, ratchetRef.current.toJSON());
+    }
   }, [draft]);
 
   if (phase === "chatting") {
     return (
       <main className="flex flex-1 flex-col px-4 py-6 max-w-lg mx-auto w-full">
+        <div className="flex items-center justify-between mb-1">
+          <button onClick={backToList} className="text-sm text-neutral-500 hover:text-neutral-300">
+            ← Chats
+          </button>
+          <button
+            onClick={() => activePeerKeyRef.current && handleDelete(activePeerKeyRef.current, activeLabel)}
+            aria-label="Borrar conversación"
+            title="Borrar conversación"
+            className="text-sm text-red-500 hover:text-red-400"
+          >
+            🗑 Borrar
+          </button>
+        </div>
         <h1 className="bg-gradient-to-r from-blue-500 to-pink-500 bg-clip-text text-2xl font-bold text-transparent mb-1">
-          Telepath
+          {activeLabel || "Telepath"}
         </h1>
         <p className="text-xs text-neutral-500 mb-4">
           Sesión cifrada extremo a extremo establecida.
@@ -225,6 +314,63 @@ export default function Home() {
             Enviar
           </button>
         </form>
+        {errorText && <p className="text-sm text-red-500 mt-2">{errorText}</p>}
+      </main>
+    );
+  }
+
+  if (phase === "list") {
+    return (
+      <main className="flex flex-1 flex-col px-4 py-6 max-w-lg mx-auto w-full">
+        <div className="flex items-center justify-between mb-4">
+          <h1 className="bg-gradient-to-r from-blue-500 to-pink-500 bg-clip-text text-3xl font-bold text-transparent">
+            Telepath
+          </h1>
+          <button
+            onClick={startNewConversation}
+            className="rounded-full bg-gradient-to-r from-blue-500 to-pink-500 px-4 py-2 text-sm font-medium text-white"
+          >
+            + Nueva
+          </button>
+        </div>
+
+        {conversations.length === 0 ? (
+          <p className="text-sm text-neutral-500 text-center mt-12">
+            Todavía no vinculaste ningún dispositivo. Tocá &quot;+ Nueva&quot; para empezar.
+          </p>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {conversations.map((conv) => {
+              const last = conv.messages[conv.messages.length - 1];
+              return (
+                <div
+                  key={conv.peerPublicKey}
+                  className="flex items-center gap-2 rounded-2xl border border-neutral-800 px-4 py-3"
+                >
+                  <button
+                    onClick={() => openConversation(conv)}
+                    className="flex-1 text-left min-w-0"
+                  >
+                    <p className="text-sm font-medium truncate">{conv.label}</p>
+                    <p className="text-xs text-neutral-500 truncate">
+                      {last ? (last.fromMe ? "Vos: " : "") + last.text : "Sin mensajes todavía"}
+                    </p>
+                  </button>
+                  <button
+                    onClick={() => handleDelete(conv.peerPublicKey, conv.label)}
+                    aria-label={`Borrar conversación con ${conv.label}`}
+                    title="Borrar conversación"
+                    className="text-neutral-600 hover:text-red-500 text-sm px-1"
+                  >
+                    🗑
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {errorText && <p className="text-sm text-red-500 mt-4 text-center">{errorText}</p>}
       </main>
     );
   }
@@ -273,7 +419,7 @@ export default function Home() {
         <div className="flex flex-col items-center gap-6 w-full max-w-xs">
           <button
             onClick={startPairing}
-            disabled={phase !== "idle"}
+            disabled={phase !== "new"}
             className="w-full rounded-full bg-gradient-to-r from-blue-500 to-pink-500 px-8 py-3 font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
           >
             {phase === "loading" ? "Conectando..." : "Vincular dispositivo"}
@@ -287,7 +433,7 @@ export default function Home() {
 
           <button
             onClick={startScanning}
-            disabled={phase !== "idle"}
+            disabled={phase !== "new"}
             className="w-full rounded-full border border-neutral-700 px-8 py-3 font-medium disabled:opacity-50"
           >
             Escanear QR
@@ -302,12 +448,18 @@ export default function Home() {
             />
             <button
               onClick={() => joinWithCode()}
-              disabled={phase !== "idle"}
+              disabled={phase !== "new"}
               className="rounded-full border border-neutral-700 px-4 py-2 text-sm font-medium disabled:opacity-50"
             >
               Unirme
             </button>
           </div>
+
+          {phase !== "loading" && (
+            <button onClick={backToList} className="text-xs text-neutral-500 hover:text-neutral-300">
+              ← Volver a chats
+            </button>
+          )}
         </div>
       )}
 
