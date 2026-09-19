@@ -158,7 +158,22 @@ export class RatchetSession {
     };
   }
 
+  // decryptAndAdvance mutates skipped keys, DH state, chain keys, and
+  // counters before the AEAD tag is checked in finishDecrypt. Snapshot the
+  // state first and restore it on any failure, so a forged or corrupted
+  // message can't leave the live ratchet in a half-advanced state that
+  // then gets persisted by the next successful send/receive.
   async decrypt(msg: WireMessage): Promise<string> {
+    const snapshot = this.toJSON();
+    try {
+      return await this.decryptAndAdvance(msg);
+    } catch (err) {
+      this.state = RatchetSession.fromJSON(snapshot).state;
+      throw err;
+    }
+  }
+
+  private async decryptAndAdvance(msg: WireMessage): Promise<string> {
     const skipped = this.trySkippedMessageKeys(msg);
     if (skipped) return this.finishDecrypt(skipped, msg);
 

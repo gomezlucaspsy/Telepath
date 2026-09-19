@@ -32,8 +32,12 @@ function writeIndex(keys: string[]): void {
 }
 
 export function loadConversation(peerPublicKey: string): StoredConversation | null {
-  const raw = localStorage.getItem(conversationKey(peerPublicKey));
-  return raw ? (JSON.parse(raw) as StoredConversation) : null;
+  try {
+    const raw = localStorage.getItem(conversationKey(peerPublicKey));
+    return raw ? (JSON.parse(raw) as StoredConversation) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function saveConversation(conv: StoredConversation): void {

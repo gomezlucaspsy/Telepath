@@ -56,25 +56,32 @@ export default function Home() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scanAbortRef = useRef<AbortController | null>(null);
+  // Only one ratchet session is ever live at a time (the open conversation),
+  // so a single queue is enough to stop overlapping decrypts from mutating
+  // ratchetRef.current concurrently — SignalR fires each incoming message
+  // without waiting for the previous handler's promise to settle.
+  const incomingQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   const refreshConversations = useCallback(() => {
     setConversations(listConversations());
   }, []);
 
   const handleIncoming = useCallback((msg: IncomingMessage) => {
-    if (!ratchetRef.current || msg.senderConnectionId !== peerConnectionIdRef.current) return;
-    const wireMsg = JSON.parse(msg.payload) as WireMessage;
-    ratchetRef.current
-      .decrypt(wireMsg)
-      .then((text) => {
+    incomingQueueRef.current = incomingQueueRef.current.then(async () => {
+      if (!ratchetRef.current || msg.senderConnectionId !== peerConnectionIdRef.current) return;
+      try {
+        const wireMsg = JSON.parse(msg.payload) as WireMessage;
+        const text = await ratchetRef.current.decrypt(wireMsg);
         setMessages((prev) => [...prev, { fromMe: false, text }]);
         const peerKey = activePeerKeyRef.current;
         if (peerKey && ratchetRef.current) {
           appendMessage(peerKey, { fromMe: false, text }, ratchetRef.current.toJSON());
           refreshConversations();
         }
-      })
-      .catch(() => setErrorText("No se pudo descifrar un mensaje entrante."));
+      } catch {
+        setErrorText("No se pudo descifrar un mensaje entrante.");
+      }
+    });
   }, [refreshConversations]);
 
   useEffect(() => {
@@ -93,6 +100,19 @@ export default function Home() {
           setOwnUsername(existingUsername);
           claimUsername(existingUsername, publicKeyToBase64(identity.publicKey), connection.connectionId);
         }
+
+        // SignalR assigns a new connectionId on every reconnect. Without
+        // this, the username directory keeps pointing at the dead
+        // connection and contacts who added us by username can't reach us.
+        connection.onreconnected((connectionId) => {
+          connectionIdRef.current = connectionId ?? null;
+          const name = getOwnUsername();
+          if (name && connectionId) {
+            claimUsername(name, publicKeyToBase64(identity.publicKey), connectionId).catch(() => {
+              setErrorText("No se pudo actualizar tu username tras reconectar.");
+            });
+          }
+        });
 
         refreshConversations();
         setPhase("list");
@@ -255,17 +275,28 @@ export default function Home() {
       setQrDataUrl(await QRCode.toDataURL(data.code));
       setPhase("waiting-peer");
 
+      let consecutiveFailures = 0;
       pollRef.current = setInterval(async () => {
-        const statusRes = await fetch(`${API_URL}/api/pairing/session/${data.code}`);
-        if (!statusRes.ok) return;
-        const status: SessionStatusResponse = await statusRes.json();
-        if (status.isCompleted && status.peerPublicKey && status.peerConnectionId) {
-          if (pollRef.current) clearInterval(pollRef.current);
-          const session = await establishSession(
-            identityRef.current!,
-            publicKeyFromBase64(status.peerPublicKey)
-          );
-          openEstablishedConversation(status.peerPublicKey, status.peerConnectionId, session);
+        try {
+          const statusRes = await fetch(`${API_URL}/api/pairing/session/${data.code}`);
+          if (!statusRes.ok) return;
+          const status: SessionStatusResponse = await statusRes.json();
+          if (status.isCompleted && status.peerPublicKey && status.peerConnectionId) {
+            if (pollRef.current) clearInterval(pollRef.current);
+            const session = await establishSession(
+              identityRef.current!,
+              publicKeyFromBase64(status.peerPublicKey)
+            );
+            openEstablishedConversation(status.peerPublicKey, status.peerConnectionId, session);
+          }
+          consecutiveFailures = 0;
+        } catch {
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 5 && pollRef.current) {
+            clearInterval(pollRef.current);
+            setErrorText("Se perdió la conexión con el servidor mientras esperábamos al otro dispositivo.");
+            setPhase("new");
+          }
         }
       }, 2000);
     } catch {

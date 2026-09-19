@@ -33,3 +33,31 @@ export function publicKeyToBase64(publicKey: Uint8Array): string {
 export function publicKeyFromBase64(b64: string): Uint8Array {
   return base64ToBytes(b64);
 }
+
+const SIGNING_STORAGE_KEY = "telepath.identitySigningKeyPair.v1";
+
+export type SigningKeyPair = { publicKey: Uint8Array; privateKey: Uint8Array };
+
+// Separate Ed25519 signing identity, used only to prove possession of the
+// private key when claiming/refreshing a username (see lib/username.ts).
+// The main identity keypair above is an X25519 box keypair and can't sign.
+export async function getOrCreateSigningKeyPair(): Promise<SigningKeyPair> {
+  const sodium = await getSodium();
+  const stored = localStorage.getItem(SIGNING_STORAGE_KEY);
+  if (stored) {
+    const parsed = JSON.parse(stored) as { publicKey: string; privateKey: string };
+    return {
+      publicKey: base64ToBytes(parsed.publicKey),
+      privateKey: base64ToBytes(parsed.privateKey),
+    };
+  }
+  const keyPair = sodium.crypto_sign_keypair();
+  localStorage.setItem(
+    SIGNING_STORAGE_KEY,
+    JSON.stringify({
+      publicKey: bytesToBase64(keyPair.publicKey),
+      privateKey: bytesToBase64(keyPair.privateKey),
+    })
+  );
+  return { publicKey: keyPair.publicKey, privateKey: keyPair.privateKey };
+}

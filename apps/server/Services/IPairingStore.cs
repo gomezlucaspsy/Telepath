@@ -20,11 +20,11 @@ public class InMemoryPairingStore : IPairingStore
 
     public PairingSession Create(string creatorPublicKey, string creatorConnectionId)
     {
-        // A predictable PRNG here would let an attacker bias/guess pairing
-        // codes and race a legitimate peer to complete the key exchange
-        // (see Complete() below) — this code gates the one moment two
-        // identity keys get introduced, so it needs a CSPRNG, not Random.Shared.
-        var code = RandomNumberGenerator.GetInt32(0, 1_000_000).ToString("D6");
+        // A six-digit code has only ~20 bits of entropy — an attacker can
+        // brute-force it online within the 5-minute window with no rate
+        // limiting in front of Complete(). Use a 128-bit opaque token
+        // instead so online guessing is infeasible.
+        var code = GenerateOpaqueToken();
         var session = new PairingSession
         {
             Code = code,
@@ -50,15 +50,25 @@ public class InMemoryPairingStore : IPairingStore
     public bool Complete(string code, string peerPublicKey, string peerConnectionId)
     {
         var session = Get(code);
-        // First writer wins. Without this check, a second caller (an
-        // attacker who observed or guessed the code) could silently
-        // overwrite an already-completed session's peer key and hijack
-        // the key exchange — the creator would establish a ratchet
-        // session with the attacker's identity key instead of the real
-        // peer's, with no error on either side.
-        if (session is null || session.IsCompleted) return false;
-        session.PeerPublicKey = peerPublicKey;
-        session.PeerConnectionId = peerConnectionId;
+        if (session is null) return false;
+        // Check-then-write on IsCompleted is only safe if serialized: two
+        // concurrent requests can both observe IsCompleted == false and
+        // both write, with the second silently overwriting the first
+        // peer's key. Locking the session instance makes the
+        // check-and-claim one atomic transition, so only the winner writes.
+        lock (session)
+        {
+            if (session.IsCompleted) return false;
+            session.PeerPublicKey = peerPublicKey;
+            session.PeerConnectionId = peerConnectionId;
+        }
         return true;
+    }
+
+    private static string GenerateOpaqueToken()
+    {
+        Span<byte> bytes = stackalloc byte[16];
+        RandomNumberGenerator.Fill(bytes);
+        return Convert.ToBase64String(bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
     }
 }
