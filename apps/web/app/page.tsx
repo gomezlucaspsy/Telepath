@@ -21,7 +21,7 @@ import { claimUsername, getOwnUsername, lookupUsername } from "@/lib/username";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://localhost:7218";
 
-type Phase = "loading" | "list" | "new" | "waiting-peer" | "scanning" | "chatting" | "error";
+type Phase = "loading" | "list" | "new" | "waiting-peer" | "scanning" | "chatting" | "share" | "error";
 type ChatMessage = { fromMe: boolean; text: string };
 
 type SessionStatusResponse = {
@@ -44,6 +44,7 @@ export default function Home() {
   const [errorText, setErrorText] = useState<string | null>(null);
   const [ownUsername, setOwnUsername] = useState<string | null>(null);
   const [addByUsernameInput, setAddByUsernameInput] = useState("");
+  const [appShareQrDataUrl, setAppShareQrDataUrl] = useState<string | null>(null);
 
   const identityRef = useRef<KeyPair | null>(null);
   const connectionRef = useRef<HubConnection | null>(null);
@@ -151,6 +152,30 @@ export default function Home() {
     }
     refreshConversations();
   }, [refreshConversations]);
+
+  const openShareApp = useCallback(async () => {
+    setErrorText(null);
+    setAppShareQrDataUrl(await QRCode.toDataURL(window.location.origin));
+    setPhase("share");
+  }, []);
+
+  const shareAppLink = useCallback(async () => {
+    const url = window.location.origin;
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: "Telepath", text: "Chateá conmigo por Telepath, cifrado extremo a extremo:", url });
+        return;
+      } catch {
+        // user cancelled the native sheet — fall through to clipboard
+      }
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      setErrorText(null);
+    } catch {
+      setErrorText("No se pudo copiar el link automáticamente, copialo manual.");
+    }
+  }, []);
 
   const startNewConversation = useCallback(() => {
     setErrorText(null);
@@ -403,6 +428,48 @@ export default function Home() {
     );
   }
 
+  if (phase === "share") {
+    return (
+      <main className="flex flex-1 flex-col items-center justify-center gap-6 px-6 text-center">
+        <div>
+          <h1 className="bg-gradient-to-r from-blue-500 to-pink-500 bg-clip-text text-3xl font-bold text-transparent">
+            Compartir Telepath
+          </h1>
+          <p className="mt-2 text-sm text-neutral-500">
+            Que la instale quien escanee este QR o abra el link. Sin fricción.
+          </p>
+        </div>
+
+        {appShareQrDataUrl && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={appShareQrDataUrl}
+            alt="Código QR para instalar Telepath"
+            className="size-56 rounded-lg border border-neutral-800"
+          />
+        )}
+
+        <p className="font-mono text-xs text-neutral-500 break-all max-w-xs">
+          {typeof window !== "undefined" ? window.location.origin : ""}
+        </p>
+
+        <div className="flex flex-col items-center gap-3 w-full max-w-xs">
+          <button
+            onClick={shareAppLink}
+            className="w-full rounded-full bg-gradient-to-r from-blue-500 to-pink-500 px-8 py-3 font-medium text-white transition-opacity hover:opacity-90"
+          >
+            Compartir link
+          </button>
+          <button onClick={backToList} className="text-xs text-neutral-500 hover:text-neutral-300">
+            ← Volver a chats
+          </button>
+        </div>
+
+        {errorText && <p className="text-sm text-red-500">{errorText}</p>}
+      </main>
+    );
+  }
+
   if (phase === "list") {
     return (
       <main className="flex flex-1 flex-col px-4 py-6 max-w-lg mx-auto w-full">
@@ -410,14 +477,24 @@ export default function Home() {
           <h1 className="bg-gradient-to-r from-blue-500 to-pink-500 bg-clip-text text-3xl font-bold text-transparent">
             Telepath
           </h1>
-          <button
-            onClick={startNewConversation}
-            aria-label="Vincular nuevo dispositivo"
-            title="Vincular nuevo dispositivo"
-            className="flex size-9 items-center justify-center rounded-full bg-gradient-to-r from-blue-500 to-pink-500 text-lg font-medium text-white leading-none"
-          >
-            +
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={openShareApp}
+              aria-label="Compartir Telepath"
+              title="Compartir Telepath"
+              className="flex size-9 items-center justify-center rounded-full border border-neutral-700 text-base leading-none"
+            >
+              🔗
+            </button>
+            <button
+              onClick={startNewConversation}
+              aria-label="Vincular nuevo dispositivo"
+              title="Vincular nuevo dispositivo"
+              className="flex size-9 items-center justify-center rounded-full bg-gradient-to-r from-blue-500 to-pink-500 text-lg font-medium text-white leading-none"
+            >
+              +
+            </button>
+          </div>
         </div>
 
         <button
