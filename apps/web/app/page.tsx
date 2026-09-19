@@ -225,8 +225,8 @@ export default function Home() {
     setErrorText(null);
   }, [ownUsername]);
 
-  const addByUsername = useCallback(async () => {
-    const username = addByUsernameInput.trim();
+  const addByUsername = useCallback(async (usernameArg?: string) => {
+    const username = (usernameArg ?? addByUsernameInput).trim();
     if (!identityRef.current || !username) return;
     setErrorText(null);
     const found = await lookupUsername(username);
@@ -237,6 +237,40 @@ export default function Home() {
     const session = await establishSession(identityRef.current, publicKeyFromBase64(found.publicKey));
     openEstablishedConversation(found.publicKey, found.connectionId, session, username.toLowerCase());
   }, [addByUsernameInput, openEstablishedConversation]);
+
+  const shareMyUsername = useCallback(async () => {
+    if (!ownUsername) return;
+    const url = `${window.location.origin}/?u=${encodeURIComponent(ownUsername)}`;
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: "Telepath", text: `Agregame en Telepath: @${ownUsername}`, url });
+        return;
+      } catch {
+        // user cancelled the native sheet — fall through to clipboard
+      }
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      setErrorText(null);
+    } catch {
+      setErrorText("No se pudo copiar el link automáticamente, copialo manual.");
+    }
+  }, [ownUsername]);
+
+  // Deep link: opening ?u=<username> auto-adds that contact, so a shared
+  // link is a one-tap add instead of retyping a username by hand.
+  const deepLinkHandledRef = useRef(false);
+  useEffect(() => {
+    if (phase !== "list" || deepLinkHandledRef.current) return;
+    const wantedUsername = new URLSearchParams(window.location.search).get("u");
+    if (!wantedUsername) return;
+    deepLinkHandledRef.current = true;
+    window.history.replaceState({}, "", window.location.pathname);
+    setErrorText(null);
+    setAddByUsernameInput(wantedUsername);
+    setPhase("new");
+    addByUsername(wantedUsername);
+  }, [phase, addByUsername]);
 
   const startPairing = useCallback(async () => {
     if (!identityRef.current || !connectionIdRef.current) return;
@@ -497,12 +531,24 @@ export default function Home() {
           </div>
         </div>
 
-        <button
-          onClick={handleSetOwnUsername}
-          className="self-start text-xs text-neutral-500 hover:text-neutral-300 mb-4"
-        >
-          👤 {ownUsername ? `@${ownUsername}` : "Elegí tu username para que te agreguen"}
-        </button>
+        <div className="flex items-center gap-3 mb-4">
+          <button
+            onClick={handleSetOwnUsername}
+            className="text-xs text-neutral-500 hover:text-neutral-300"
+          >
+            👤 {ownUsername ? `@${ownUsername}` : "Elegí tu username para que te agreguen"}
+          </button>
+          {ownUsername && (
+            <button
+              onClick={shareMyUsername}
+              aria-label="Compartir mi link"
+              title="Compartir mi link"
+              className="text-xs text-neutral-400 hover:text-neutral-200"
+            >
+              🔗 Compartir mi link
+            </button>
+          )}
+        </div>
 
         {conversations.length === 0 ? (
           <p className="text-sm text-neutral-500 text-center mt-12">
@@ -647,7 +693,7 @@ export default function Home() {
               className="flex-1 rounded-full border border-neutral-700 bg-transparent px-4 py-2 text-sm outline-none"
             />
             <button
-              onClick={addByUsername}
+              onClick={() => addByUsername()}
               disabled={phase !== "new"}
               className="rounded-full border border-neutral-700 px-4 py-2 text-sm font-medium disabled:opacity-50"
             >
