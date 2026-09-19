@@ -9,6 +9,7 @@ builder.Services.AddControllers();
 builder.Services.AddOpenApi();
 builder.Services.AddSignalR();
 builder.Services.AddSingleton<IPairingStore, InMemoryPairingStore>();
+builder.Services.AddSingleton<IUsernameDirectory, InMemoryUsernameDirectory>();
 
 var allowedOrigins = (builder.Configuration["AllowedOrigins"] ?? "http://localhost:3000")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);

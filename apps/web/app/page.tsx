@@ -14,8 +14,10 @@ import {
   createConversation,
   deleteConversation,
   listConversations,
+  renameConversation,
   type StoredConversation,
 } from "@/lib/conversations";
+import { claimUsername, getOwnUsername, lookupUsername } from "@/lib/username";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://localhost:7218";
 
@@ -40,6 +42,8 @@ export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [errorText, setErrorText] = useState<string | null>(null);
+  const [ownUsername, setOwnUsername] = useState<string | null>(null);
+  const [addByUsernameInput, setAddByUsernameInput] = useState("");
 
   const identityRef = useRef<KeyPair | null>(null);
   const connectionRef = useRef<HubConnection | null>(null);
@@ -47,6 +51,7 @@ export default function Home() {
   const ratchetRef = useRef<RatchetSession | null>(null);
   const peerConnectionIdRef = useRef<string | null>(null);
   const activePeerKeyRef = useRef<string | null>(null);
+  const activePeerUsernameRef = useRef<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scanAbortRef = useRef<AbortController | null>(null);
@@ -81,6 +86,13 @@ export default function Home() {
         if (cancelled) return;
         connectionRef.current = connection;
         connectionIdRef.current = connection.connectionId;
+
+        const existingUsername = getOwnUsername();
+        if (existingUsername && connection.connectionId) {
+          setOwnUsername(existingUsername);
+          claimUsername(existingUsername, publicKeyToBase64(identity.publicKey), connection.connectionId);
+        }
+
         refreshConversations();
         setPhase("list");
       } catch {
@@ -101,6 +113,7 @@ export default function Home() {
     ratchetRef.current = RatchetSession.fromJSON(conv.ratchetSessionJson);
     peerConnectionIdRef.current = conv.peerConnectionId;
     activePeerKeyRef.current = conv.peerPublicKey;
+    activePeerUsernameRef.current = conv.peerUsername;
     setActiveLabel(conv.label);
     setMessages(conv.messages.map((m) => ({ fromMe: m.fromMe, text: m.text })));
     setErrorText(null);
@@ -111,6 +124,7 @@ export default function Home() {
     ratchetRef.current = null;
     peerConnectionIdRef.current = null;
     activePeerKeyRef.current = null;
+    activePeerUsernameRef.current = null;
     setMessages([]);
     refreshConversations();
     setPhase("list");
@@ -128,28 +142,76 @@ export default function Home() {
     }
   }, [backToList, refreshConversations]);
 
+  const handleRename = useCallback((peerPublicKey: string, currentLabel: string) => {
+    const name = window.prompt("Nombre del contacto:", currentLabel);
+    if (!name || !name.trim()) return;
+    renameConversation(peerPublicKey, name.trim());
+    if (activePeerKeyRef.current === peerPublicKey) {
+      setActiveLabel(name.trim());
+    }
+    refreshConversations();
+  }, [refreshConversations]);
+
   const startNewConversation = useCallback(() => {
     setErrorText(null);
     setJoinCodeInput("");
+    setAddByUsernameInput("");
     setQrDataUrl(null);
     setPairingCode(null);
     setPhase("new");
   }, []);
 
-  const openEstablishedConversation = useCallback((peerPublicKey: string, peerConnectionId: string, session: RatchetSession) => {
+  const openEstablishedConversation = useCallback((
+    peerPublicKey: string,
+    peerConnectionId: string,
+    session: RatchetSession,
+    peerUsername?: string | null
+  ) => {
     ratchetRef.current = session;
     peerConnectionIdRef.current = peerConnectionId;
     const conv = createConversation({
       peerPublicKey,
       peerConnectionId,
+      peerUsername,
       ratchetSessionJson: session.toJSON(),
     });
     activePeerKeyRef.current = conv.peerPublicKey;
+    activePeerUsernameRef.current = conv.peerUsername;
     setActiveLabel(conv.label);
     setMessages(conv.messages.map((m) => ({ fromMe: m.fromMe, text: m.text })));
     refreshConversations();
     setPhase("chatting");
   }, [refreshConversations]);
+
+  const handleSetOwnUsername = useCallback(async () => {
+    if (!identityRef.current || !connectionIdRef.current) return;
+    const chosen = window.prompt("Elegí tu username (3-20 caracteres, letras/números/_):", ownUsername ?? "");
+    if (!chosen || !chosen.trim()) return;
+    const result = await claimUsername(
+      chosen.trim(),
+      publicKeyToBase64(identityRef.current.publicKey),
+      connectionIdRef.current
+    );
+    if (!result.ok) {
+      setErrorText(result.error);
+      return;
+    }
+    setOwnUsername(chosen.trim().toLowerCase());
+    setErrorText(null);
+  }, [ownUsername]);
+
+  const addByUsername = useCallback(async () => {
+    const username = addByUsernameInput.trim();
+    if (!identityRef.current || !username) return;
+    setErrorText(null);
+    const found = await lookupUsername(username);
+    if (!found) {
+      setErrorText("No encontramos ese username, o esa persona no está conectada ahora.");
+      return;
+    }
+    const session = await establishSession(identityRef.current, publicKeyFromBase64(found.publicKey));
+    openEstablishedConversation(found.publicKey, found.connectionId, session, username.toLowerCase());
+  }, [addByUsernameInput, openEstablishedConversation]);
 
   const startPairing = useCallback(async () => {
     if (!identityRef.current || !connectionIdRef.current) return;
@@ -244,9 +306,21 @@ export default function Home() {
   }, [phase, joinWithCode]);
 
   const sendMessage = useCallback(async () => {
-    if (!draft.trim() || !ratchetRef.current || !connectionRef.current || !peerConnectionIdRef.current) {
-      return;
+    if (!draft.trim() || !ratchetRef.current || !connectionRef.current) return;
+
+    // A contact added by username is never really "lost": look up their
+    // current connectionId fresh instead of trusting the cached one, which
+    // goes stale the moment they reload or reconnect.
+    if (activePeerUsernameRef.current) {
+      const fresh = await lookupUsername(activePeerUsernameRef.current);
+      if (!fresh) {
+        setErrorText("Tu contacto no está conectado ahora mismo.");
+        return;
+      }
+      peerConnectionIdRef.current = fresh.connectionId;
     }
+    if (!peerConnectionIdRef.current) return;
+
     const text = draft.trim();
     setDraft("");
     const wireMsg = await ratchetRef.current.encrypt(text);
@@ -265,14 +339,24 @@ export default function Home() {
           <button onClick={backToList} className="text-sm text-neutral-500 hover:text-neutral-300">
             ← Chats
           </button>
-          <button
-            onClick={() => activePeerKeyRef.current && handleDelete(activePeerKeyRef.current, activeLabel)}
-            aria-label="Borrar conversación"
-            title="Borrar conversación"
-            className="text-sm text-red-500 hover:text-red-400"
-          >
-            🗑 Borrar
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => activePeerKeyRef.current && handleRename(activePeerKeyRef.current, activeLabel)}
+              aria-label="Agendar como contacto"
+              title="Agendar como contacto"
+              className="text-sm text-neutral-400 hover:text-neutral-200"
+            >
+              👤
+            </button>
+            <button
+              onClick={() => activePeerKeyRef.current && handleDelete(activePeerKeyRef.current, activeLabel)}
+              aria-label="Borrar conversación"
+              title="Borrar conversación"
+              className="text-sm text-red-500 hover:text-red-400"
+            >
+              🗑
+            </button>
+          </div>
         </div>
         <h1 className="bg-gradient-to-r from-blue-500 to-pink-500 bg-clip-text text-2xl font-bold text-transparent mb-1">
           {activeLabel || "Telepath"}
@@ -322,21 +406,30 @@ export default function Home() {
   if (phase === "list") {
     return (
       <main className="flex flex-1 flex-col px-4 py-6 max-w-lg mx-auto w-full">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center justify-between mb-1">
           <h1 className="bg-gradient-to-r from-blue-500 to-pink-500 bg-clip-text text-3xl font-bold text-transparent">
             Telepath
           </h1>
           <button
             onClick={startNewConversation}
-            className="rounded-full bg-gradient-to-r from-blue-500 to-pink-500 px-4 py-2 text-sm font-medium text-white"
+            aria-label="Vincular nuevo dispositivo"
+            title="Vincular nuevo dispositivo"
+            className="flex size-9 items-center justify-center rounded-full bg-gradient-to-r from-blue-500 to-pink-500 text-lg font-medium text-white leading-none"
           >
-            + Nueva
+            +
           </button>
         </div>
 
+        <button
+          onClick={handleSetOwnUsername}
+          className="self-start text-xs text-neutral-500 hover:text-neutral-300 mb-4"
+        >
+          👤 {ownUsername ? `@${ownUsername}` : "Elegí tu username para que te agreguen"}
+        </button>
+
         {conversations.length === 0 ? (
           <p className="text-sm text-neutral-500 text-center mt-12">
-            Todavía no vinculaste ningún dispositivo. Tocá &quot;+ Nueva&quot; para empezar.
+            Todavía no vinculaste ningún dispositivo. Tocá el + para empezar.
           </p>
         ) : (
           <div className="flex flex-col gap-2">
@@ -355,6 +448,14 @@ export default function Home() {
                     <p className="text-xs text-neutral-500 truncate">
                       {last ? (last.fromMe ? "Vos: " : "") + last.text : "Sin mensajes todavía"}
                     </p>
+                  </button>
+                  <button
+                    onClick={() => handleRename(conv.peerPublicKey, conv.label)}
+                    aria-label={`Agendar contacto ${conv.label}`}
+                    title="Agendar como contacto"
+                    className="text-neutral-600 hover:text-neutral-300 text-sm px-1"
+                  >
+                    👤
                   </button>
                   <button
                     onClick={() => handleDelete(conv.peerPublicKey, conv.label)}
@@ -452,6 +553,28 @@ export default function Home() {
               className="rounded-full border border-neutral-700 px-4 py-2 text-sm font-medium disabled:opacity-50"
             >
               Unirme
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2 w-full text-neutral-600 text-xs">
+            <div className="h-px flex-1 bg-neutral-800" />
+            o agregá por username
+            <div className="h-px flex-1 bg-neutral-800" />
+          </div>
+
+          <div className="flex w-full gap-2">
+            <input
+              value={addByUsernameInput}
+              onChange={(e) => setAddByUsernameInput(e.target.value)}
+              placeholder="@username"
+              className="flex-1 rounded-full border border-neutral-700 bg-transparent px-4 py-2 text-sm outline-none"
+            />
+            <button
+              onClick={addByUsername}
+              disabled={phase !== "new"}
+              className="rounded-full border border-neutral-700 px-4 py-2 text-sm font-medium disabled:opacity-50"
+            >
+              Agregar
             </button>
           </div>
 

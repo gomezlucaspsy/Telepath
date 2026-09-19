@@ -7,6 +7,7 @@ export type StoredMessage = { fromMe: boolean; text: string; at: number };
 export type StoredConversation = {
   peerPublicKey: string; // base64 identity key — stable primary key for the conversation
   peerConnectionId: string | null; // last known SignalR id; goes stale on peer reconnect, routing-only
+  peerUsername: string | null; // if set, re-looked-up before each send so the contact is never truly lost
   label: string;
   createdAt: number;
   updatedAt: number;
@@ -55,6 +56,7 @@ export function listConversations(): StoredConversation[] {
 export function createConversation(params: {
   peerPublicKey: string;
   peerConnectionId: string;
+  peerUsername?: string | null;
   ratchetSessionJson: string;
 }): StoredConversation {
   const existing = loadConversation(params.peerPublicKey);
@@ -62,12 +64,21 @@ export function createConversation(params: {
   const conv: StoredConversation = {
     peerPublicKey: params.peerPublicKey,
     peerConnectionId: params.peerConnectionId,
-    label: existing?.label ?? `Dispositivo ${params.peerPublicKey.slice(0, 6)}`,
+    peerUsername: params.peerUsername ?? existing?.peerUsername ?? null,
+    label: existing?.label ?? params.peerUsername ?? `Dispositivo ${params.peerPublicKey.slice(0, 6)}`,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
     ratchetSessionJson: params.ratchetSessionJson,
     messages: existing?.messages ?? [],
   };
+  saveConversation(conv);
+  return conv;
+}
+
+export function renameConversation(peerPublicKey: string, label: string): StoredConversation | null {
+  const conv = loadConversation(peerPublicKey);
+  if (!conv) return null;
+  conv.label = label;
   saveConversation(conv);
   return conv;
 }
