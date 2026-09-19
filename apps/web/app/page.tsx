@@ -66,8 +66,18 @@ export default function Home() {
     setConversations(listConversations());
   }, []);
 
+  // Chains `task` onto the shared queue so it can never interleave with any
+  // other queued task (incoming decrypt or outgoing encrypt) on the same
+  // ratchet state, while keeping the queue itself always settled so one
+  // failing task doesn't permanently jam later ones.
+  const runInRatchetQueue = useCallback((task: () => Promise<void>): Promise<void> => {
+    const result = incomingQueueRef.current.then(task);
+    incomingQueueRef.current = result.catch(() => {});
+    return result;
+  }, []);
+
   const handleIncoming = useCallback((msg: IncomingMessage) => {
-    incomingQueueRef.current = incomingQueueRef.current.then(async () => {
+    runInRatchetQueue(async () => {
       if (!ratchetRef.current || msg.senderConnectionId !== peerConnectionIdRef.current) return;
       try {
         const wireMsg = JSON.parse(msg.payload) as WireMessage;
@@ -82,7 +92,7 @@ export default function Home() {
         setErrorText("No se pudo descifrar un mensaje entrante.");
       }
     });
-  }, [refreshConversations]);
+  }, [refreshConversations, runInRatchetQueue]);
 
   useEffect(() => {
     let cancelled = false;
@@ -108,17 +118,23 @@ export default function Home() {
           connectionIdRef.current = connectionId ?? null;
           const name = getOwnUsername();
           if (name && connectionId) {
-            claimUsername(name, publicKeyToBase64(identity.publicKey), connectionId).catch(() => {
-              setErrorText("No se pudo actualizar tu username tras reconectar.");
-            });
+            claimUsername(name, publicKeyToBase64(identity.publicKey), connectionId)
+              .then((result) => {
+                if (!result.ok) setErrorText(result.error);
+              })
+              .catch(() => setErrorText("No se pudo actualizar tu username tras reconectar."));
           }
         });
 
         refreshConversations();
         setPhase("list");
-      } catch {
+      } catch (err) {
         if (!cancelled) {
-          setErrorText("No se pudo conectar con el servidor. ¿Está corriendo el backend?");
+          setErrorText(
+            err instanceof Error && err.message === "CORRUPTED_IDENTITY_KEY"
+              ? "Tu clave de identidad local está dañada y no se puede recuperar automáticamente."
+              : "No se pudo conectar con el servidor. ¿Está corriendo el backend?"
+          );
           setPhase("error");
         }
       }
@@ -279,7 +295,9 @@ export default function Home() {
       pollRef.current = setInterval(async () => {
         try {
           const statusRes = await fetch(`${API_URL}/api/pairing/session/${data.code}`);
-          if (!statusRes.ok) return;
+          if (!statusRes.ok) {
+            throw new Error(`Pairing status failed: ${statusRes.status}`);
+          }
           const status: SessionStatusResponse = await statusRes.json();
           if (status.isCompleted && status.peerPublicKey && status.peerConnectionId) {
             if (pollRef.current) clearInterval(pollRef.current);
@@ -379,14 +397,25 @@ export default function Home() {
 
     const text = draft.trim();
     setDraft("");
-    const wireMsg = await ratchetRef.current.encrypt(text);
-    await sendEncrypted(connectionRef.current, peerConnectionIdRef.current, JSON.stringify(wireMsg));
-    setMessages((prev) => [...prev, { fromMe: true, text }]);
-    const peerKey = activePeerKeyRef.current;
-    if (peerKey) {
-      appendMessage(peerKey, { fromMe: true, text }, ratchetRef.current.toJSON());
+
+    try {
+      // Route through the same queue handleIncoming uses: encrypt() and
+      // decrypt() both mutate ratchetRef.current, so a send racing an
+      // incoming message could otherwise interleave the two mutations.
+      await runInRatchetQueue(async () => {
+        if (!ratchetRef.current || !connectionRef.current || !peerConnectionIdRef.current) return;
+        const wireMsg = await ratchetRef.current.encrypt(text);
+        await sendEncrypted(connectionRef.current, peerConnectionIdRef.current, JSON.stringify(wireMsg));
+        setMessages((prev) => [...prev, { fromMe: true, text }]);
+        const peerKey = activePeerKeyRef.current;
+        if (peerKey) {
+          appendMessage(peerKey, { fromMe: true, text }, ratchetRef.current.toJSON());
+        }
+      });
+    } catch {
+      setErrorText("No se pudo enviar el mensaje.");
     }
-  }, [draft]);
+  }, [draft, runInRatchetQueue]);
 
   if (phase === "chatting") {
     return (

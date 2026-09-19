@@ -9,11 +9,18 @@ export async function getOrCreateIdentityKeyPair(): Promise<KeyPair> {
   const sodium = await getSodium();
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored) {
-    const parsed = JSON.parse(stored) as { publicKey: string; privateKey: string };
-    return {
-      publicKey: base64ToBytes(parsed.publicKey),
-      privateKey: base64ToBytes(parsed.privateKey),
-    };
+    try {
+      const parsed = JSON.parse(stored) as { publicKey: string; privateKey: string };
+      return {
+        publicKey: base64ToBytes(parsed.publicKey),
+        privateKey: base64ToBytes(parsed.privateKey),
+      };
+    } catch {
+      // Every existing conversation is bound to this key's public half, so
+      // silently regenerating it would silently orphan all of them with no
+      // way for the user to know why. Surface it instead of guessing.
+      throw new Error("CORRUPTED_IDENTITY_KEY");
+    }
   }
   const keyPair = sodium.crypto_box_keypair();
   localStorage.setItem(
@@ -45,11 +52,18 @@ export async function getOrCreateSigningKeyPair(): Promise<SigningKeyPair> {
   const sodium = await getSodium();
   const stored = localStorage.getItem(SIGNING_STORAGE_KEY);
   if (stored) {
-    const parsed = JSON.parse(stored) as { publicKey: string; privateKey: string };
-    return {
-      publicKey: base64ToBytes(parsed.publicKey),
-      privateKey: base64ToBytes(parsed.privateKey),
-    };
+    try {
+      const parsed = JSON.parse(stored) as { publicKey: string; privateKey: string };
+      return {
+        publicKey: base64ToBytes(parsed.publicKey),
+        privateKey: base64ToBytes(parsed.privateKey),
+      };
+    } catch {
+      // Unlike the main identity key, this only gates username claims —
+      // regenerating it is low blast radius, so it's safe to self-heal
+      // instead of permanently blocking every future username claim.
+      localStorage.removeItem(SIGNING_STORAGE_KEY);
+    }
   }
   const keyPair = sodium.crypto_sign_keypair();
   localStorage.setItem(

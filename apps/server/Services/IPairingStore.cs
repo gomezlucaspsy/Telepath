@@ -9,7 +9,22 @@ public interface IPairingStore
     PairingSession Create(string creatorPublicKey, string creatorConnectionId);
     PairingSession? Get(string code);
     bool Complete(string code, string peerPublicKey, string peerConnectionId);
+
+    // Returns IsCompleted/PeerPublicKey/PeerConnectionId as one consistent
+    // read, taken under the same lock Complete() writes under — reading
+    // those fields off Get()'s session directly can observe IsCompleted
+    // (derived from PeerPublicKey) as true while PeerConnectionId is still
+    // being assigned by a concurrent Complete() call.
+    PairingSessionSnapshot? GetSnapshot(string code);
 }
+
+public record PairingSessionSnapshot(
+    bool IsCompleted,
+    string CreatorPublicKey,
+    string CreatorConnectionId,
+    string? PeerPublicKey,
+    string? PeerConnectionId
+);
 
 // In-memory placeholder for scaffolding. Swap for a persistent store
 // (Redis, etc.) before production — sessions must not survive a restart
@@ -63,6 +78,22 @@ public class InMemoryPairingStore : IPairingStore
             session.PeerConnectionId = peerConnectionId;
         }
         return true;
+    }
+
+    public PairingSessionSnapshot? GetSnapshot(string code)
+    {
+        var session = Get(code);
+        if (session is null) return null;
+        lock (session)
+        {
+            return new PairingSessionSnapshot(
+                session.IsCompleted,
+                session.CreatorPublicKey,
+                session.CreatorConnectionId,
+                session.PeerPublicKey,
+                session.PeerConnectionId
+            );
+        }
     }
 
     private static string GenerateOpaqueToken()
