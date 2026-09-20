@@ -88,3 +88,15 @@ export async function getOrCreateSigningKeyPair(): Promise<SigningKeyPair> {
   );
   return { publicKey: keyPair.publicKey, privateKey: keyPair.privateKey };
 }
+
+// Signs `message` with an Ed25519 signing keypair and returns the base64
+// signature — the ownership-proof primitive shared by username claims
+// (lib/username.ts) and connection announcements (lib/signalr.ts).
+export async function signWithIdentity(signingKeyPair: SigningKeyPair, message: string): Promise<string> {
+  const sodium = await getSodium();
+  const signature = sodium.crypto_sign_detached(
+    new TextEncoder().encode(message),
+    signingKeyPair.privateKey
+  );
+  return bytesToBase64(signature);
+}

@@ -1,6 +1,5 @@
-import { getSodium } from "./crypto/sodium";
 import { bytesToBase64 } from "./crypto/bytes";
-import { getOrCreateSigningKeyPair } from "./crypto/identity";
+import { getOrCreateSigningKeyPair, signWithIdentity } from "./crypto/identity";
 
 const STORAGE_KEY = "telepath.username.v1";
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://localhost:7218";
@@ -22,11 +21,9 @@ export async function claimUsername(
   publicKey: string,
   connectionId: string
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const sodium = await getSodium();
   const signingKeyPair = await getOrCreateSigningKeyPair();
   const normalized = username.trim().toLowerCase();
-  const message = new TextEncoder().encode(`${normalized}:${connectionId}`);
-  const signature = sodium.crypto_sign_detached(message, signingKeyPair.privateKey);
+  const signature = await signWithIdentity(signingKeyPair, `${normalized}:${connectionId}`);
 
   let res: Response;
   try {
@@ -38,7 +35,7 @@ export async function claimUsername(
         publicKey,
         connectionId,
         signingPublicKey: bytesToBase64(signingKeyPair.publicKey),
-        signature: bytesToBase64(signature),
+        signature,
       }),
     });
   } catch {
