@@ -24,8 +24,13 @@ public partial class UsersController(IUsernameDirectory directory) : ControllerB
             return BadRequest("Username inválido: 3-20 caracteres, letras/números/guión bajo.");
         }
 
-        var ok = directory.Register(request.Username, request.PublicKey, request.ConnectionId);
-        return ok ? NoContent() : Conflict("Ese username ya está en uso.");
+        var ok = directory.Register(
+            request.Username,
+            request.PublicKey,
+            request.ConnectionId,
+            request.SigningPublicKey,
+            request.Signature);
+        return ok ? NoContent() : Conflict("Ese username ya está en uso, o la firma no es válida.");
     }
 
     // Called by whoever wants to add this username as a contact.

@@ -8,6 +8,7 @@ RUN dotnet publish Telepath.Server.csproj -c Release -o /app --no-restore
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
 COPY --from=build /app .
+USER $APP_UID
 ENV ASPNETCORE_URLS=http://+:8080
 ENV ASPNETCORE_HTTP_PORTS=8080
 EXPOSE 8080

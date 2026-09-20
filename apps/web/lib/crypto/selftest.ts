@@ -51,14 +51,22 @@ async function main() {
   const plain5 = await bobSession.decrypt(msg5);
   assert(plain5 === "post-serializacion", "session survives toJSON/fromJSON round-trip");
 
+  // msg1 uses a stale dh value at this point, so decrypting it would trigger
+  // another DH ratchet step instead of isolating ciphertext-only tampering.
+  // Encrypt a fresh message against the current ratchet state instead.
   let tamperFailed = false;
+  const victim = await restored.encrypt("mensaje intacto");
   try {
-    const tampered = { ...msg1, ciphertext: msg1.ciphertext.slice(0, -4) + "abcd" };
+    const tampered = { ...victim, ciphertext: victim.ciphertext.slice(0, -4) + "abcd" };
     await bobSession.decrypt(tampered);
   } catch {
     tamperFailed = true;
   }
   assert(tamperFailed, "tampered ciphertext is rejected");
+  assert(
+    (await bobSession.decrypt(victim)) === "mensaje intacto",
+    "session still works after a rejected message"
+  );
 
   console.log("\nAll ratchet self-tests passed.");
 }

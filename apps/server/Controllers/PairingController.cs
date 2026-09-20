@@ -21,14 +21,14 @@ public class PairingController(IPairingStore store) : ControllerBase
     [HttpGet("session/{code}")]
     public ActionResult<PairingSessionStatusResponse> GetSession(string code)
     {
-        var session = store.Get(code);
-        if (session is null) return NotFound();
+        var snapshot = store.GetSnapshot(code);
+        if (snapshot is null) return NotFound();
         return Ok(new PairingSessionStatusResponse(
-            session.IsCompleted,
-            session.CreatorPublicKey,
-            session.CreatorConnectionId,
-            session.PeerPublicKey,
-            session.PeerConnectionId
+            snapshot.IsCompleted,
+            snapshot.CreatorPublicKey,
+            snapshot.CreatorConnectionId,
+            snapshot.PeerPublicKey,
+            snapshot.PeerConnectionId
         ));
     }
 

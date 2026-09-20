@@ -56,26 +56,43 @@ export default function Home() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scanAbortRef = useRef<AbortController | null>(null);
+  // Only one ratchet session is ever live at a time (the open conversation),
+  // so a single queue is enough to stop overlapping decrypts from mutating
+  // ratchetRef.current concurrently — SignalR fires each incoming message
+  // without waiting for the previous handler's promise to settle.
+  const incomingQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   const refreshConversations = useCallback(() => {
     setConversations(listConversations());
   }, []);
 
+  // Chains `task` onto the shared queue so it can never interleave with any
+  // other queued task (incoming decrypt or outgoing encrypt) on the same
+  // ratchet state, while keeping the queue itself always settled so one
+  // failing task doesn't permanently jam later ones.
+  const runInRatchetQueue = useCallback((task: () => Promise<void>): Promise<void> => {
+    const result = incomingQueueRef.current.then(task);
+    incomingQueueRef.current = result.catch(() => {});
+    return result;
+  }, []);
+
   const handleIncoming = useCallback((msg: IncomingMessage) => {
-    if (!ratchetRef.current || msg.senderConnectionId !== peerConnectionIdRef.current) return;
-    const wireMsg = JSON.parse(msg.payload) as WireMessage;
-    ratchetRef.current
-      .decrypt(wireMsg)
-      .then((text) => {
+    runInRatchetQueue(async () => {
+      if (!ratchetRef.current || msg.senderConnectionId !== peerConnectionIdRef.current) return;
+      try {
+        const wireMsg = JSON.parse(msg.payload) as WireMessage;
+        const text = await ratchetRef.current.decrypt(wireMsg);
         setMessages((prev) => [...prev, { fromMe: false, text }]);
         const peerKey = activePeerKeyRef.current;
         if (peerKey && ratchetRef.current) {
           appendMessage(peerKey, { fromMe: false, text }, ratchetRef.current.toJSON());
           refreshConversations();
         }
-      })
-      .catch(() => setErrorText("No se pudo descifrar un mensaje entrante."));
-  }, [refreshConversations]);
+      } catch {
+        setErrorText("No se pudo descifrar un mensaje entrante.");
+      }
+    });
+  }, [refreshConversations, runInRatchetQueue]);
 
   useEffect(() => {
     let cancelled = false;
@@ -94,11 +111,30 @@ export default function Home() {
           claimUsername(existingUsername, publicKeyToBase64(identity.publicKey), connection.connectionId);
         }
 
+        // SignalR assigns a new connectionId on every reconnect. Without
+        // this, the username directory keeps pointing at the dead
+        // connection and contacts who added us by username can't reach us.
+        connection.onreconnected((connectionId) => {
+          connectionIdRef.current = connectionId ?? null;
+          const name = getOwnUsername();
+          if (name && connectionId) {
+            claimUsername(name, publicKeyToBase64(identity.publicKey), connectionId)
+              .then((result) => {
+                if (!result.ok) setErrorText(result.error);
+              })
+              .catch(() => setErrorText("No se pudo actualizar tu username tras reconectar."));
+          }
+        });
+
         refreshConversations();
         setPhase("list");
-      } catch {
+      } catch (err) {
         if (!cancelled) {
-          setErrorText("No se pudo conectar con el servidor. ¿Está corriendo el backend?");
+          setErrorText(
+            err instanceof Error && err.message === "CORRUPTED_IDENTITY_KEY"
+              ? "Tu clave de identidad local está dañada y no se puede recuperar automáticamente."
+              : "No se pudo conectar con el servidor. ¿Está corriendo el backend?"
+          );
           setPhase("error");
         }
       }
@@ -255,17 +291,30 @@ export default function Home() {
       setQrDataUrl(await QRCode.toDataURL(data.code));
       setPhase("waiting-peer");
 
+      let consecutiveFailures = 0;
       pollRef.current = setInterval(async () => {
-        const statusRes = await fetch(`${API_URL}/api/pairing/session/${data.code}`);
-        if (!statusRes.ok) return;
-        const status: SessionStatusResponse = await statusRes.json();
-        if (status.isCompleted && status.peerPublicKey && status.peerConnectionId) {
-          if (pollRef.current) clearInterval(pollRef.current);
-          const session = await establishSession(
-            identityRef.current!,
-            publicKeyFromBase64(status.peerPublicKey)
-          );
-          openEstablishedConversation(status.peerPublicKey, status.peerConnectionId, session);
+        try {
+          const statusRes = await fetch(`${API_URL}/api/pairing/session/${data.code}`);
+          if (!statusRes.ok) {
+            throw new Error(`Pairing status failed: ${statusRes.status}`);
+          }
+          const status: SessionStatusResponse = await statusRes.json();
+          if (status.isCompleted && status.peerPublicKey && status.peerConnectionId) {
+            if (pollRef.current) clearInterval(pollRef.current);
+            const session = await establishSession(
+              identityRef.current!,
+              publicKeyFromBase64(status.peerPublicKey)
+            );
+            openEstablishedConversation(status.peerPublicKey, status.peerConnectionId, session);
+          }
+          consecutiveFailures = 0;
+        } catch {
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 5 && pollRef.current) {
+            clearInterval(pollRef.current);
+            setErrorText("Se perdió la conexión con el servidor mientras esperábamos al otro dispositivo.");
+            setPhase("new");
+          }
         }
       }, 2000);
     } catch {
@@ -348,14 +397,25 @@ export default function Home() {
 
     const text = draft.trim();
     setDraft("");
-    const wireMsg = await ratchetRef.current.encrypt(text);
-    await sendEncrypted(connectionRef.current, peerConnectionIdRef.current, JSON.stringify(wireMsg));
-    setMessages((prev) => [...prev, { fromMe: true, text }]);
-    const peerKey = activePeerKeyRef.current;
-    if (peerKey) {
-      appendMessage(peerKey, { fromMe: true, text }, ratchetRef.current.toJSON());
+
+    try {
+      // Route through the same queue handleIncoming uses: encrypt() and
+      // decrypt() both mutate ratchetRef.current, so a send racing an
+      // incoming message could otherwise interleave the two mutations.
+      await runInRatchetQueue(async () => {
+        if (!ratchetRef.current || !connectionRef.current || !peerConnectionIdRef.current) return;
+        const wireMsg = await ratchetRef.current.encrypt(text);
+        await sendEncrypted(connectionRef.current, peerConnectionIdRef.current, JSON.stringify(wireMsg));
+        setMessages((prev) => [...prev, { fromMe: true, text }]);
+        const peerKey = activePeerKeyRef.current;
+        if (peerKey) {
+          appendMessage(peerKey, { fromMe: true, text }, ratchetRef.current.toJSON());
+        }
+      });
+    } catch {
+      setErrorText("No se pudo enviar el mensaje.");
     }
-  }, [draft]);
+  }, [draft, runInRatchetQueue]);
 
   if (phase === "chatting") {
     return (
