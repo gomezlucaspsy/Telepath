@@ -11,10 +11,18 @@ export async function getOrCreateIdentityKeyPair(): Promise<KeyPair> {
   if (stored) {
     try {
       const parsed = JSON.parse(stored) as { publicKey: string; privateKey: string };
-      return {
-        publicKey: base64ToBytes(parsed.publicKey),
-        privateKey: base64ToBytes(parsed.privateKey),
-      };
+      const publicKey = base64ToBytes(parsed.publicKey);
+      const privateKey = base64ToBytes(parsed.privateKey);
+      // Valid JSON/base64 can still decode to the wrong number of bytes —
+      // that wouldn't throw here, only later inside crypto_scalarmult with
+      // a much more confusing error. Check lengths up front instead.
+      if (
+        publicKey.length !== sodium.crypto_box_PUBLICKEYBYTES ||
+        privateKey.length !== sodium.crypto_box_SECRETKEYBYTES
+      ) {
+        throw new Error("bad key length");
+      }
+      return { publicKey, privateKey };
     } catch {
       // Every existing conversation is bound to this key's public half, so
       // silently regenerating it would silently orphan all of them with no
@@ -54,10 +62,15 @@ export async function getOrCreateSigningKeyPair(): Promise<SigningKeyPair> {
   if (stored) {
     try {
       const parsed = JSON.parse(stored) as { publicKey: string; privateKey: string };
-      return {
-        publicKey: base64ToBytes(parsed.publicKey),
-        privateKey: base64ToBytes(parsed.privateKey),
-      };
+      const publicKey = base64ToBytes(parsed.publicKey);
+      const privateKey = base64ToBytes(parsed.privateKey);
+      if (
+        publicKey.length !== sodium.crypto_sign_PUBLICKEYBYTES ||
+        privateKey.length !== sodium.crypto_sign_SECRETKEYBYTES
+      ) {
+        throw new Error("bad key length");
+      }
+      return { publicKey, privateKey };
     } catch {
       // Unlike the main identity key, this only gates username claims —
       // regenerating it is low blast radius, so it's safe to self-heal
