@@ -3,8 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import type { HubConnection } from "@microsoft/signalr";
-import { connectChatHub, sendEncrypted, type IncomingMessage } from "@/lib/signalr";
-import { getOrCreateIdentityKeyPair, publicKeyFromBase64, publicKeyToBase64 } from "@/lib/crypto/identity";
+import { announceIdentity, connectChatHub, sendEncrypted, type IncomingMessage } from "@/lib/signalr";
+import {
+  getOrCreateIdentityKeyPair,
+  getOrCreateSigningKeyPair,
+  publicKeyFromBase64,
+  publicKeyToBase64,
+  signWithIdentity,
+} from "@/lib/crypto/identity";
 import { establishSession } from "@/lib/crypto/session";
 import { RatchetSession, type WireMessage } from "@/lib/crypto/doubleRatchet";
 import type { KeyPair } from "@/lib/crypto/identity";
@@ -50,9 +56,7 @@ export default function Home() {
   const connectionRef = useRef<HubConnection | null>(null);
   const connectionIdRef = useRef<string | null>(null);
   const ratchetRef = useRef<RatchetSession | null>(null);
-  const peerConnectionIdRef = useRef<string | null>(null);
   const activePeerKeyRef = useRef<string | null>(null);
-  const activePeerUsernameRef = useRef<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scanAbortRef = useRef<AbortController | null>(null);
@@ -78,7 +82,7 @@ export default function Home() {
 
   const handleIncoming = useCallback((msg: IncomingMessage) => {
     runInRatchetQueue(async () => {
-      if (!ratchetRef.current || msg.senderConnectionId !== peerConnectionIdRef.current) return;
+      if (!ratchetRef.current || msg.senderPublicKey !== activePeerKeyRef.current) return;
       try {
         const wireMsg = JSON.parse(msg.payload) as WireMessage;
         const text = await ratchetRef.current.decrypt(wireMsg);
@@ -94,6 +98,31 @@ export default function Home() {
     });
   }, [refreshConversations, runInRatchetQueue]);
 
+  // Proves we hold the private key for our identity and registers where to
+  // reach us right now. Messages sent to us while we're not announced (or
+  // announced under a stale connectionId) sit in the server's mailbox until
+  // our next successful announce, instead of being silently dropped.
+  const announce = useCallback(async (connection: HubConnection, identity: KeyPair) => {
+    if (!connection.connectionId) return;
+    const identityPublicKey = publicKeyToBase64(identity.publicKey);
+    const signingKeyPair = await getOrCreateSigningKeyPair();
+    const signature = await signWithIdentity(
+      signingKeyPair,
+      `announce:${identityPublicKey}:${connection.connectionId}`
+    );
+    try {
+      const ok = await announceIdentity(
+        connection,
+        identityPublicKey,
+        publicKeyToBase64(signingKeyPair.publicKey),
+        signature
+      );
+      if (!ok) setErrorText("No se pudo registrar tu conexión en el servidor.");
+    } catch {
+      setErrorText("No se pudo registrar tu conexión en el servidor.");
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -104,6 +133,7 @@ export default function Home() {
         if (cancelled) return;
         connectionRef.current = connection;
         connectionIdRef.current = connection.connectionId;
+        await announce(connection, identity);
 
         const existingUsername = getOwnUsername();
         if (existingUsername && connection.connectionId) {
@@ -111,14 +141,16 @@ export default function Home() {
           claimUsername(existingUsername, publicKeyToBase64(identity.publicKey), connection.connectionId);
         }
 
-        // SignalR assigns a new connectionId on every reconnect. Without
-        // this, the username directory keeps pointing at the dead
-        // connection and contacts who added us by username can't reach us.
-        connection.onreconnected((connectionId) => {
-          connectionIdRef.current = connectionId ?? null;
+        // SignalR assigns a new connectionId on every reconnect. Re-announce
+        // so the presence directory (and therefore message routing) follows
+        // us to the new connection, and re-claim the username for the same
+        // reason.
+        connection.onreconnected(() => {
+          connectionIdRef.current = connection.connectionId ?? null;
+          announce(connection, identity);
           const name = getOwnUsername();
-          if (name && connectionId) {
-            claimUsername(name, publicKeyToBase64(identity.publicKey), connectionId)
+          if (name && connection.connectionId) {
+            claimUsername(name, publicKeyToBase64(identity.publicKey), connection.connectionId)
               .then((result) => {
                 if (!result.ok) setErrorText(result.error);
               })
@@ -144,13 +176,11 @@ export default function Home() {
       if (pollRef.current) clearInterval(pollRef.current);
       connectionRef.current?.stop();
     };
-  }, [handleIncoming, refreshConversations]);
+  }, [announce, handleIncoming, refreshConversations]);
 
   const openConversation = useCallback((conv: StoredConversation) => {
     ratchetRef.current = RatchetSession.fromJSON(conv.ratchetSessionJson);
-    peerConnectionIdRef.current = conv.peerConnectionId;
     activePeerKeyRef.current = conv.peerPublicKey;
-    activePeerUsernameRef.current = conv.peerUsername;
     setActiveLabel(conv.label);
     setMessages(conv.messages.map((m) => ({ fromMe: m.fromMe, text: m.text })));
     setErrorText(null);
@@ -159,9 +189,7 @@ export default function Home() {
 
   const backToList = useCallback(() => {
     ratchetRef.current = null;
-    peerConnectionIdRef.current = null;
     activePeerKeyRef.current = null;
-    activePeerUsernameRef.current = null;
     setMessages([]);
     refreshConversations();
     setPhase("list");
@@ -229,7 +257,6 @@ export default function Home() {
     peerUsername?: string | null
   ) => {
     ratchetRef.current = session;
-    peerConnectionIdRef.current = peerConnectionId;
     const conv = createConversation({
       peerPublicKey,
       peerConnectionId,
@@ -237,7 +264,6 @@ export default function Home() {
       ratchetSessionJson: session.toJSON(),
     });
     activePeerKeyRef.current = conv.peerPublicKey;
-    activePeerUsernameRef.current = conv.peerUsername;
     setActiveLabel(conv.label);
     setMessages(conv.messages.map((m) => ({ fromMe: m.fromMe, text: m.text })));
     refreshConversations();
@@ -380,20 +406,7 @@ export default function Home() {
   }, [phase, joinWithCode]);
 
   const sendMessage = useCallback(async () => {
-    if (!draft.trim() || !ratchetRef.current || !connectionRef.current) return;
-
-    // A contact added by username is never really "lost": look up their
-    // current connectionId fresh instead of trusting the cached one, which
-    // goes stale the moment they reload or reconnect.
-    if (activePeerUsernameRef.current) {
-      const fresh = await lookupUsername(activePeerUsernameRef.current);
-      if (!fresh) {
-        setErrorText("Tu contacto no está conectado ahora mismo.");
-        return;
-      }
-      peerConnectionIdRef.current = fresh.connectionId;
-    }
-    if (!peerConnectionIdRef.current) return;
+    if (!draft.trim() || !ratchetRef.current || !connectionRef.current || !activePeerKeyRef.current) return;
 
     const text = draft.trim();
     setDraft("");
@@ -402,15 +415,15 @@ export default function Home() {
       // Route through the same queue handleIncoming uses: encrypt() and
       // decrypt() both mutate ratchetRef.current, so a send racing an
       // incoming message could otherwise interleave the two mutations.
+      // Addressed by the peer's identity key — the server's presence
+      // directory resolves it to their current connection (or mailboxes it
+      // if they're offline), so there's no stale connectionId to refresh.
       await runInRatchetQueue(async () => {
-        if (!ratchetRef.current || !connectionRef.current || !peerConnectionIdRef.current) return;
+        if (!ratchetRef.current || !connectionRef.current || !activePeerKeyRef.current) return;
         const wireMsg = await ratchetRef.current.encrypt(text);
-        await sendEncrypted(connectionRef.current, peerConnectionIdRef.current, JSON.stringify(wireMsg));
+        await sendEncrypted(connectionRef.current, activePeerKeyRef.current, JSON.stringify(wireMsg));
         setMessages((prev) => [...prev, { fromMe: true, text }]);
-        const peerKey = activePeerKeyRef.current;
-        if (peerKey) {
-          appendMessage(peerKey, { fromMe: true, text }, ratchetRef.current.toJSON());
-        }
+        appendMessage(activePeerKeyRef.current, { fromMe: true, text }, ratchetRef.current.toJSON());
       });
     } catch {
       setErrorText("No se pudo enviar el mensaje.");

@@ -10,6 +10,8 @@ builder.Services.AddOpenApi();
 builder.Services.AddSignalR();
 builder.Services.AddSingleton<IPairingStore, InMemoryPairingStore>();
 builder.Services.AddSingleton<IUsernameDirectory, InMemoryUsernameDirectory>();
+builder.Services.AddSingleton<IPresenceDirectory, InMemoryPresenceDirectory>();
+builder.Services.AddSingleton<IMailboxStore, InMemoryMailboxStore>();
 
 var allowedOrigins = (builder.Configuration["AllowedOrigins"] ?? "http://localhost:3000")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
